@@ -15,7 +15,7 @@ GitHub Actions dumps `public` + `auth` (+ `storage` metadata when readable), enc
 
 ## Schedule
 
-- Cron: `0 0 * * *` (00:00 UTC ≈ 03:00 Israel standard / 02:00–03:00 with DST)
+- Cron: `0 0 * * *` (00:00 UTC = 02:00 Israel winter / 03:00 Israel summer)
 - Also: **Actions → Backup → Run workflow**
 
 ## Keepalive
