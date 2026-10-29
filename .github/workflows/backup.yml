@@ -1,0 +1,231 @@
+name: Backup
+
+on:
+  schedule:
+    # 00:00 UTC ≈ 03:00 Asia/Jerusalem (winter); DST shifts local by ±1h
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PG_MAJOR: '17'
+  DUMP_FILE: backup.dump
+  AGE_FILE: backup.dump.age
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    services:
+      postgres:
+        # Same major as Supabase project (PostgreSQL 17.x)
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+          POSTGRES_DB: restore_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d restore_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    steps:
+      - name: Checkout (expected counts)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install PostgreSQL 17 client (PGDG) and age
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq curl ca-certificates gnupg lsb-release
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor -o /usr/share/keyrings/postgresql.gpg
+          echo "deb [signed-by=/usr/share/keyrings/postgresql.gpg] http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list > /dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq "postgresql-client-${PG_MAJOR}" age
+          psql --version
+          pg_dump --version
+          age --version
+
+      - name: Validate secrets / variables
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          AGE_PUBLIC_KEY: ${{ vars.AGE_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SUPABASE_DB_URL:-}" ]; then
+            echo "::error::SUPABASE_DB_URL secret is empty. Add the session-pooler URL as a repository secret."
+            exit 1
+          fi
+          if [ -z "${AGE_PUBLIC_KEY:-}" ]; then
+            echo "::error::AGE_PUBLIC_KEY repository variable is empty. Add the age1… public key under Settings → Variables."
+            exit 1
+          fi
+          case "$AGE_PUBLIC_KEY" in
+            age1*) ;;
+            *)
+              echo "::error::AGE_PUBLIC_KEY does not look like an age recipient (expected age1…)."
+              exit 1
+              ;;
+          esac
+          echo "Secrets/variables present."
+
+      - name: pg_dump (public; auth/storage when readable)
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          set -euo pipefail
+          # Never echo SUPABASE_DB_URL.
+          # Hosted Supabase: custom roles usually cannot get USAGE on schema auth
+          # (postgres lacks GRANT OPTION; owner is supabase_admin). Try auth, then fall back.
+          dump_ok=0
+          for schemas in "public,auth,storage" "public,storage" "public,auth" "public"; do
+            IFS=',' read -r -a arr <<< "$schemas"
+            args=()
+            for s in "${arr[@]}"; do
+              args+=(--schema="$s")
+            done
+            echo "Trying pg_dump schemas: $schemas"
+            if pg_dump \
+              --dbname="$SUPABASE_DB_URL" \
+              --format=custom \
+              --no-owner \
+              --no-privileges \
+              "${args[@]}" \
+              --file="$DUMP_FILE"
+            then
+              echo "Dump succeeded with schemas: $schemas"
+              dump_ok=1
+              break
+            fi
+            echo "Dump failed for schemas: $schemas — trying narrower set…"
+            rm -f "$DUMP_FILE"
+          done
+          if [ "$dump_ok" -ne 1 ]; then
+            echo "::error::pg_dump failed for all schema sets"
+            exit 1
+          fi
+          ls -lh "$DUMP_FILE"
+
+      - name: Restore test into Postgres 17 service
+        env:
+          PGPASSWORD: postgres
+        run: |
+          set -euo pipefail
+          export PGHOST=localhost PGPORT=5432 PGUSER=postgres PGDATABASE=restore_test
+
+          psql -v ON_ERROR_STOP=1 <<'SQL'
+          DO $$
+          BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+              CREATE ROLE anon NOLOGIN;
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+              CREATE ROLE authenticated NOLOGIN;
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
+              CREATE ROLE service_role NOLOGIN BYPASSRLS;
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticator') THEN
+              CREATE ROLE authenticator NOLOGIN;
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'supabase_auth_admin') THEN
+              CREATE ROLE supabase_auth_admin NOLOGIN;
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'supabase_storage_admin') THEN
+              CREATE ROLE supabase_storage_admin NOLOGIN;
+            END IF;
+          END
+          $$;
+          CREATE SCHEMA IF NOT EXISTS auth;
+          CREATE SCHEMA IF NOT EXISTS storage;
+          CREATE SCHEMA IF NOT EXISTS extensions;
+          SQL
+
+          set +e
+          pg_restore \
+            --dbname=restore_test \
+            --no-owner \
+            --no-privileges \
+            --verbose \
+            "$DUMP_FILE" 2> restore.err
+          restore_rc=$?
+          set -e
+          # 0 = ok; 1 = some errors (often missing extension/role — OK); >=2 = fatal
+          if [ "$restore_rc" -ge 2 ]; then
+            echo "::error::pg_restore failed fatally (exit $restore_rc)"
+            tail -n 80 restore.err || true
+            exit 1
+          fi
+          echo "pg_restore finished with exit $restore_rc"
+          if [ -s restore.err ]; then
+            echo "--- restore stderr (tail) ---"
+            tail -n 40 restore.err || true
+          fi
+
+          if [ -f expected-counts.env ]; then
+            set -a
+            # shellcheck disable=SC1091
+            . ./expected-counts.env
+            set +a
+          fi
+
+          check_table() {
+            local table="$1"
+            local expected_var="EXPECTED_${table}"
+            local expected="${!expected_var:-0}"
+            local count
+            count="$(psql -Atqc "SELECT count(*) FROM public.${table};" 2>/dev/null || echo MISSING)"
+            if [ "$count" = "MISSING" ]; then
+              echo "::error::public.${table} missing after restore"
+              exit 1
+            fi
+            echo "public.${table}=${count} (expected >= ${expected})"
+            if [ "$count" -lt "$expected" ]; then
+              echo "::error::public.${table} count ${count} < expected ${expected}"
+              exit 1
+            fi
+          }
+
+          for t in \
+            businesses business_members policies staff services service_steps \
+            service_overlap_rules staff_services working_hours time_off special_days \
+            customers appointments appointment_segments audit_log \
+            holiday_sync_requests holiday_calendar
+          do
+            check_table "$t"
+          done
+
+          echo "Restore test passed (counts only)."
+
+      - name: Encrypt dump with age
+        env:
+          AGE_PUBLIC_KEY: ${{ vars.AGE_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${AGE_PUBLIC_KEY:-}" ]; then
+            echo "::error::AGE_PUBLIC_KEY empty"
+            exit 1
+          fi
+          age -r "$AGE_PUBLIC_KEY" -o "$AGE_FILE" "$DUMP_FILE"
+          rm -f "$DUMP_FILE"
+          test -f "$AGE_FILE"
+          test ! -f "$DUMP_FILE"
+          ls -lh "$AGE_FILE"
+
+      - name: Upload encrypted artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nit-calendar-backup-${{ github.run_id }}
+          path: backup.dump.age
+          retention-days: 14
+          if-no-files-found: error

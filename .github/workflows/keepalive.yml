@@ -1,0 +1,38 @@
+name: Keepalive
+
+# GitHub disables scheduled workflows after ~60 days without repo activity.
+# This monthly job touches the default branch with an empty commit so schedules
+# keep running. Requires contents: write (Actions GITHUB_TOKEN). Minimal scope.
+
+on:
+  schedule:
+    # 1st of each month, 12:00 UTC
+    - cron: '0 12 1 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: keepalive
+  cancel-in-progress: true
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Need a token that can push; default GITHUB_TOKEN works with contents: write
+          persist-credentials: true
+
+      - name: Empty commit to keep schedules alive
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Empty commit — no content change, just activity for GitHub schedule keepalive
+          git commit --allow-empty -m "chore: keepalive $(date -u +%Y-%m-%d)"
+          git push origin HEAD:${{ github.ref_name }}
